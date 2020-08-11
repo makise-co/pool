@@ -1,2 +1,2 @@
-# database
-Makise-Co Database Toolset
+# pool
+Makise-Co ConnectionPool Toolset
