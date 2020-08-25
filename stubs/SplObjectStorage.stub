@@ -1,0 +1,23 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * @template TKey
+ * @template TValue
+ *
+ * @implements \Iterator<TValue, TKey>
+ */
+class SplObjectStorage implements \Iterator
+{
+    /**
+     * @param TKey $object
+     * @param TValue $data
+     */
+    public function attach($object, $data = null): void {}
+
+    /**
+     * @param TKey $object
+     */
+    public function detach($object): void {}
+}

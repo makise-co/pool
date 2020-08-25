@@ -1,10 +1,11 @@
 {
     "name": "makise-co/pool",
-    "description": "Makise-Co Connection Pool Abstraction",
+    "description": "Swoole Connection Pool",
     "type": "library",
     "license": "MIT",
     "keywords": [
-        "makise-co",
+        "swoole",
+        "connection",
         "pool"
     ],
     "authors": [
@@ -18,12 +19,14 @@
     "require": {
         "php": ">=7.4",
         "ext-swoole": ">=4.4",
-        "open-smf/connection-pool": "^1.0"
+        "makise-co/connection": "^1.0",
+        "makise-co/ev-primitives": "^1.0"
     },
     "require-dev": {
         "swoole/ide-helper": "^4.5",
-        "phpunit/phpunit": "^9.1",
-        "symfony/var-dumper": "^5.0"
+        "phpunit/phpunit": "^9.3",
+        "symfony/var-dumper": "^5.0",
+        "phpstan/phpstan": "^0.12.38"
     },
     "autoload": {
         "psr-4": {
