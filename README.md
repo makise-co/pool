@@ -26,6 +26,8 @@ All of these parameters can be changed at runtime.
 May throw `BorrowTimeoutException` when waiting of free connection is timed out (read `maxWaitTime` parameter doc).
 May throw `PoolIsClosedException` when connection pool is closed.
 * `push` (default visibility: `protected`) - Return connection to pool
+* `getIdleCount` (visibility: public)  - Get idle connections count
+* `getTotalCount` (visibility: public)  - Get count of all connections allocated by pool 
 * `setMaxActive` (visibility: public) - read `maxActive` parameter doc
 * `setMinActive` (visibility: public) - read `minActive` parameter doc
 * `setMaxWaitTime` (visibility: public) - read `maxWaitTime` parameter doc
