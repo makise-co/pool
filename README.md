@@ -7,34 +7,52 @@ Connection Pool based on Swoole with balancer feature implementation
 * float `maxWaitTime` (default: 5.0) - The maximum number of seconds that the pool will wait (when there are no available connections)
 for a connection to be returned before throwing an exception.
 Zero value (0.0) will disable wait timeout.
-* float `validateConnectionsInterval` (default: 5.0) - The number of seconds to sleep between runs of the idle connection validation/cleaner timer.
+* float `validationInterval` (default: 5.0) - The number of seconds to sleep between runs of the idle connection validation/cleaner timer.
 This value should not be set under 1 second.
 Zero value will disable validate connections timer.
 * int `maxIdleTime` (default: 60) - The minimum amount of time (seconds) a connection may sit idle in the pool before it is eligible for closing.
-Zero (0.0) value will disable idle connections freeing.
+Zero value will disable idle connections freeing.
+* int `maxLifeTime` (default: 0) - The maximum amount of time (seconds) a connection may exist in the pool before it is eligible for closing.
+Zero value will disable expired connections freeing.
 * bool `testOnBorrow` (default: true) - The indication of whether objects will be validated before being borrowed from the pool.
 If the object fails to validate, it will be dropped from the pool, and we will attempt to borrow another.
 * bool `testOnReturn` (default: true) - The indication of whether objects will be validated before being returned to the pool
+* bool `resetConnections` (default: false) -  Reset the connection to its initial state when it is borrowed from the pool
 
-These parameters could be set by public setter methods of Pool instance.
 All of these parameters can be changed at runtime.
 
 ## API
-* `init` (visibility: public) - Initialize (start) connection pool
-* `close` (visibility: public) - Close (stop) connection pool
+* `init` - Initialize (start) connection pool
+* `close` - Close (stop) connection pool
+* `getStats` - Get connection pool statistics
 * `pop` (default visibility: `protected`) - Borrow connection from pool. 
 May throw `BorrowTimeoutException` when waiting of free connection is timed out (read `maxWaitTime` parameter doc).
 May throw `PoolIsClosedException` when connection pool is closed.
 * `push` (default visibility: `protected`) - Return connection to pool
-* `getIdleCount` (visibility: public)  - Get idle connections count
-* `getTotalCount` (visibility: public)  - Get count of all connections allocated by pool 
-* `setMaxActive` (visibility: public) - read `maxActive` parameter doc
-* `setMinActive` (visibility: public) - read `minActive` parameter doc
-* `setMaxWaitTime` (visibility: public) - read `maxWaitTime` parameter doc
-* `setMaxIdleTime` (visibility: public) - read `maxIdleTime` parameter doc
-* `setValidateConnectionsInterval` (visibility: public) - read `validateConnectionsInterval` parameter doc
-* `setTestOnBorrow` (visibility: public) - read `testOnBorrow` parameter doc
-* `setTestOnReturn` (visibility: public) - read `testOnReturn` parameter doc
+
+### Getters
+* `getIdleCount` - Get idle connections count
+* `getTotalCount` - Get count of connections created by the pool
+* `getMaxActive` - read `maxActive` parameter doc
+* `getMinActive` - read `minActive` parameter doc
+* `getMaxWaitTime` - read `maxWaitTime` parameter doc
+* `getMaxIdleTime` - read `maxIdleTime` parameter doc
+* `getMaxLifeTime` - read `maxLifeTime` parameter doc
+* `getValidationInterval` - read `validationInterval` parameter doc
+* `getTestOnBorrow` - read `testOnBorrow` parameter doc
+* `getTestOnReturn` - read `testOnReturn` parameter doc
+* `getResetConnections` - read `resetConnections` parameter doc
+
+### Setters
+* `setMaxActive` - read `maxActive` parameter doc
+* `setMinActive` - read `minActive` parameter doc
+* `setMaxWaitTime` - read `maxWaitTime` parameter doc
+* `setMaxIdleTime` - read `maxIdleTime` parameter doc
+* `setMaxLifeTime` - read `maxLifeTime` parameter doc
+* `setValidationInterval` - read `validationInterval` parameter doc
+* `setTestOnBorrow` - read `testOnBorrow` parameter doc
+* `setTestOnReturn` - read `testOnReturn` parameter doc
+* `setResetConnections` - read `resetConnections` parameter doc
 
 ## Complete example (HTTP Connection Pool)
 ```php
@@ -151,6 +169,10 @@ class HttpConnection implements HttpConnectionInterface
     public function getLastUsedAt(): int
     {
         return $this->lastUsedAt;
+    }
+
+    public function resetSession(): void
+    {
     }
 
     public static function connect(HttpConnectionConfig $config): self
@@ -291,7 +313,18 @@ run(static function () {
         printf("Task: %s returned %d status code\n", $result->task, $result->success->statusCode);
     }
 
-    printf("\nResults fetched in %.4f secs\n", round($end - $start, 4));
+    printf("\nResults fetched in %.4f secs\n\n", round($end - $start, 4));
+
+    $stats = $httpPool->getStats();
+
+    printf("Connections limit = %d\n", $stats->maxActive);
+    printf("Connections count = %d\n", $stats->totalCount);
+    printf("Idle connections = %d\n", $stats->idle);
+    printf("Busy connections = %d\n", $stats->inUse);
+
+    printf("Total wait time for an available connections = %f secs\n", $stats->waitDuration);
+    printf("Total wait count = %d\n", $stats->waitCount);
+    printf("Average wait time per one connection = %f secs\n", $stats->waitDuration / $stats->waitCount);
 
     $httpPool->close();
 });
@@ -300,15 +333,22 @@ run(static function () {
 
 Output is:
 ```
-php some.php
-Task: /help returned 404 status code
-Task: / returned 301 status code
 Task: /test returned 404 status code
+Task: / returned 301 status code
 Task: /search returned 301 status code
+Task: /help returned 404 status code
 Task: /query returned 404 status code
 Task: /images returned 301 status code
 Task: /mail returned 301 status code
 Task: /videos returned 404 status code
 
-Results fetched in 0.1697 secs
+Results fetched in 0.1483 secs
+
+Connections limit = 4
+Connections count = 4
+Idle connections = 4
+Busy connections = 0
+Total wait time for an available connections = 0.380008 secs
+Total wait count = 4
+Average wait time per one connection = 0.095002 secs
 ```

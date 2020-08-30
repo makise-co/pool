@@ -9,7 +9,7 @@ use InvalidArgumentException;
 use MakiseCo\Connection\ConnectionConfigInterface;
 use MakiseCo\Connection\ConnectionInterface;
 use MakiseCo\Connection\ConnectorInterface;
-use MakiseCo\EvPrimitives\Deferred;
+use MakiseCo\EvPrimitives\Lock;
 use MakiseCo\EvPrimitives\Timer;
 use MakiseCo\Pool\Exception\BorrowTimeoutException;
 use MakiseCo\Pool\Exception\PoolIsClosedException;
@@ -17,6 +17,7 @@ use SplObjectStorage;
 use Swoole\Coroutine;
 use Throwable;
 
+use function microtime;
 use function time;
 
 use const SWOOLE_CHANNEL_OK;
@@ -24,6 +25,41 @@ use const SWOOLE_CHANNEL_TIMEOUT;
 
 abstract class Pool implements PoolInterface
 {
+    /**
+     * Connection accepted by pool
+     */
+    public const PUSH_OK = 0;
+
+    /**
+     * Connection discarded by pool, because pool is not initialized
+     */
+    public const PUSH_POOL_NOT_INITIALIZED = 1;
+
+    /**
+     * Connection discarded by pool, because passed connection is not part of pool
+     */
+    public const PUSH_CONN_NOT_PART_OF_POOL = 2;
+
+    /**
+     * Connection discarded by pool, because maximum connection limit has reached
+     */
+    public const PUSH_LIMIT_REACHED = 3;
+
+    /**
+     * Connection discarded by pool, because connection is dead
+     */
+    public const PUSH_DEAD_CONNECTION = 4;
+
+    /**
+     * Connection discarded by pool, because pool was closed
+     */
+    public const PUSH_POOL_CLOSED = 5;
+
+    /**
+     * Connection discarded by pool, because connection max life time has reached
+     */
+    public const PUSH_MAX_LIFE_TIME = 6;
+
     private ConnectionConfigInterface $connectionConfig;
     private ConnectorInterface $connector;
 
@@ -57,12 +93,17 @@ abstract class Pool implements PoolInterface
      * This value should not be set under 1 second.
      * It dictates how often we check for idle, abandoned connections, and how often we validate idle connections
      */
-    private float $validateConnectionsInterval = 5.0;
+    private float $validationInterval = 5.0;
 
     /**
      * The minimum amount of time (seconds) a connection may sit idle in the pool before it is eligible for closing
      */
     private int $maxIdleTime = 60;
+
+    /**
+     * The maximum amount of time (seconds) a connection may exist in the pool before it is eligible for closing
+     */
+    private int $maxLifeTime = 0;
 
     /**
      * The indication of whether objects will be validated before being borrowed from the pool.
@@ -76,9 +117,14 @@ abstract class Pool implements PoolInterface
     private bool $testOnReturn = true;
 
     /**
+     * Reset the connection to its initial state when it is borrowed from the pool
+     */
+    private bool $resetConnections = false;
+
+    /**
      * Created connections storage
      *
-     * @var SplObjectStorage<ConnectionInterface, null>|ConnectionInterface[]
+     * @var SplObjectStorage<ConnectionInterface, int>|ConnectionInterface[]
      */
     private SplObjectStorage $connections;
 
@@ -92,11 +138,40 @@ abstract class Pool implements PoolInterface
     /**
      * Preventing simultaneous connection creation
      */
-    private ?Deferred $deferred = null;
+    private Lock $lock;
 
-    private Timer $validateConnectionsTimer;
+    private Timer $validationTimer;
+
+    /**
+     * Total time waited for available connections
+     */
+    private float $waitDuration = 0.0;
+
+    /**
+     * Total number of connections waited for
+     */
+    private int $waitCount = 0;
+
+    /**
+     * Total number of connections closed due to idle time
+     */
+    private int $maxIdleTimeClosedCount = 0;
+
+    /**
+     * Total number of connections closed due to max connection lifetime limit
+     */
+    private int $maxLifeTimeClosedCount = 0;
 
     abstract protected function createDefaultConnector(): ConnectorInterface;
+
+    /**
+     * Reset connection to its initial state
+     *
+     * @param ConnectionInterface $connection
+     */
+    protected function resetConnection(ConnectionInterface $connection): void
+    {
+    }
 
     public function __construct(
         ConnectionConfigInterface $connConfig,
@@ -107,8 +182,8 @@ abstract class Pool implements PoolInterface
 
         $this->connections = new SplObjectStorage();
 
-        $this->validateConnectionsTimer = new Timer(
-            (int)($this->validateConnectionsInterval * 1000),
+        $this->validationTimer = new Timer(
+            (int)($this->validationInterval * 1000),
             Closure::fromCallable([$this, 'validateConnections']),
             false
         );
@@ -128,29 +203,14 @@ abstract class Pool implements PoolInterface
         $this->isInitialized = true;
 
         $this->idle = new Coroutine\Channel($this->maxActive);
+        $this->lock = new Lock();
 
         // create initial connections
         if ($this->minActive > 0) {
-            Coroutine::create(function () {
-                try {
-                    while ($this->connections->count() < $this->maxActive) {
-                        $connection = $this->connector->connect($this->connectionConfig);
-
-                        $this->connections->attach($connection);
-
-                        if (!$this->idle->push($connection, 0.001)) {
-                            $this->connections->detach($connection);
-
-                            break;
-                        }
-                    }
-                } catch (Throwable $e) {
-                    // ignore create connection errors
-                }
-            });
+            Coroutine::create(Closure::fromCallable([$this, 'fillPool']));
         }
 
-        $this->startValidateConnectionsTimer();
+        $this->startValidationTimer();
     }
 
     public function close(): void
@@ -161,7 +221,7 @@ abstract class Pool implements PoolInterface
 
         $this->isInitialized = false;
 
-        $this->stopValidateConnectionsTimer();
+        $this->stopValidationTimer();
 
         // forget all connection instances
         foreach ($this->connections as $connection) {
@@ -173,6 +233,7 @@ abstract class Pool implements PoolInterface
             while (!$this->idle->isEmpty()) {
                 $connection = $this->idle->pop();
                 if (false === $connection) {
+                    // connection pool is closed
                     break;
                 }
 
@@ -216,11 +277,40 @@ abstract class Pool implements PoolInterface
             throw new InvalidArgumentException('maxActive should be at least 1');
         }
 
+        $oldMaxActive = $this->maxActive;
         $this->maxActive = $maxActive;
 
         // minActive cannot be greater than maxActive
         if ($this->minActive > $this->maxActive) {
             $this->minActive = $this->maxActive;
+        }
+
+        // resize connection pool
+        if ($this->isInitialized && $oldMaxActive !== $maxActive) {
+            $oldIdle = $this->idle;
+            $this->idle = new Coroutine\Channel($maxActive);
+
+            while (!$oldIdle->isEmpty()) {
+                /** @var ConnectionInterface|false $idleConnection */
+                $idleConnection = $oldIdle->pop();
+                if (false === $idleConnection) {
+                    // connection pool is closed
+                    break;
+                }
+
+                if ($this->idle->isFull()) {
+                    $this->removeConnection($idleConnection);
+
+                    continue;
+                }
+
+                if (!$this->pushConnectionToIdle($idleConnection)) {
+                    // connection pool is closed
+                    continue;
+                }
+            }
+
+            $oldIdle->close();
         }
     }
 
@@ -280,31 +370,49 @@ abstract class Pool implements PoolInterface
     }
 
     /**
+     * The maximum amount of time a connection may exist in the pool before it is eligible for closing.
+     * Zero value is disabling max life time checking
+     *
+     * @param int $maxLifeTime seconds
+     *
+     * @throws InvalidArgumentException when $maxLifeTime is less than 0
+     */
+    public function setMaxLifeTime(int $maxLifeTime): void
+    {
+        // maxIdleTime cannot be negative
+        if ($maxLifeTime < 0) {
+            throw new InvalidArgumentException('maxLifeTime should be a positive value');
+        }
+
+        $this->maxLifeTime = $maxLifeTime;
+    }
+
+    /**
      * Set the number of seconds to sleep between runs of the idle connection validation/cleaner timer.
      * This value should not be set under 1 second.
      * It dictates how often we check for idle, abandoned connections, and how often we validate idle connections.
      *
      * Zero value will disable connections checking.
      *
-     * @param float $validateConnectionsInterval seconds with milliseconds precision
+     * @param float $validationInterval seconds with milliseconds precision
      *
      * @throws InvalidArgumentException when $idleCheckInterval is less than 0
      */
-    public function setValidateConnectionsInterval(float $validateConnectionsInterval): void
+    public function setValidationInterval(float $validationInterval): void
     {
-        if ($validateConnectionsInterval < 0) {
+        if ($validationInterval < 0) {
             throw new InvalidArgumentException('validateConnectionsInterval should be a positive value');
         }
 
-        $this->validateConnectionsInterval = $validateConnectionsInterval;
+        $this->validationInterval = $validationInterval;
 
-        if ($validateConnectionsInterval === 0.0) {
+        if ($validationInterval === 0.0) {
             // stop timer on zero idle check interval
-            if ($this->validateConnectionsTimer->isStarted()) {
-                $this->validateConnectionsTimer->stop();
+            if ($this->validationTimer->isStarted()) {
+                $this->validationTimer->stop();
             }
         } else {
-            $this->validateConnectionsTimer->setInterval((int)($validateConnectionsInterval * 1000));
+            $this->validationTimer->setInterval((int)($validationInterval * 1000));
         }
     }
 
@@ -329,6 +437,16 @@ abstract class Pool implements PoolInterface
         $this->testOnReturn = $testOnReturn;
     }
 
+    /**
+     * Reset the connection to its initial state when it is borrowed from the pool
+     *
+     * @param bool $resetConnections
+     */
+    public function setResetConnections(bool $resetConnections): void
+    {
+        $this->resetConnections = $resetConnections;
+    }
+
     public function getIdleCount(): int
     {
         if (!$this->isInitialized) {
@@ -343,6 +461,69 @@ abstract class Pool implements PoolInterface
         return $this->connections->count();
     }
 
+    public function getStats(): PoolStats
+    {
+        $stats = new PoolStats();
+
+        $stats->maxActive = $this->getMaxActive();
+
+        $stats->totalCount = $this->getTotalCount();
+        $stats->idle = $this->getIdleCount();
+        $stats->inUse = $stats->totalCount - $stats->idle;
+
+        $stats->waitCount = $this->waitCount;
+        $stats->waitDuration = $this->waitDuration;
+        $stats->maxIdleTimeClosed = $this->maxIdleTimeClosedCount;
+        $stats->maxLifeTimeClosed = $this->maxLifeTimeClosedCount;
+
+        return $stats;
+    }
+
+    public function getMaxActive(): int
+    {
+        return $this->maxActive;
+    }
+
+    public function getMinActive(): int
+    {
+        return $this->minActive;
+    }
+
+    public function getMaxWaitTime(): float
+    {
+        return $this->maxWaitTime;
+    }
+
+    public function getValidationInterval(): float
+    {
+        return $this->validationInterval;
+    }
+
+    public function getMaxIdleTime(): int
+    {
+        return $this->maxIdleTime;
+    }
+
+    public function getMaxLifeTime(): int
+    {
+        return $this->maxLifeTime;
+    }
+
+    public function getTestOnBorrow(): bool
+    {
+        return $this->testOnBorrow;
+    }
+
+    public function getTestOnReturn(): bool
+    {
+        return $this->testOnReturn;
+    }
+
+    public function getResetConnections(): bool
+    {
+        return $this->resetConnections;
+    }
+
     /**
      * @throws PoolIsClosedException If the pool has been closed.
      * @throws BorrowTimeoutException when connection pop timeout reached
@@ -354,28 +535,13 @@ abstract class Pool implements PoolInterface
         }
 
         // Prevent simultaneous connection creation.
-        while ($this->deferred !== null) {
-            try {
-                $this->deferred->wait();
-            } catch (Throwable $e) {
-            }
+        while ($this->lock->isLocked()) {
+            $this->lock->wait();
         }
 
         // Max connection count has not been reached, so open another connection.
         if ($this->idle->isEmpty() && $this->connections->count() < $this->maxActive) {
-            $this->deferred = new Deferred();
-
-            try {
-                $connection = $this->connector->connect($this->connectionConfig);
-                $this->connections->attach($connection);
-            } finally {
-                $deferred = $this->deferred;
-                $this->deferred = null;
-
-                $deferred->resolve(null);
-            }
-
-            return $connection;
+            return $this->createConnection();
         }
 
         return $this->popConnectionFromIdle();
@@ -389,17 +555,61 @@ abstract class Pool implements PoolInterface
      */
     private function popConnectionFromIdle(): ConnectionInterface
     {
-        /** @var ConnectionInterface $connection */
+        $waitStart = null;
+
+        if ($this->idle->isEmpty()) {
+            $waitStart = microtime(true);
+
+            // integer overflow
+            if ($this->waitCount === PHP_INT_MAX) {
+                $this->waitCount = 0;
+                $this->waitDuration = 0.0;
+            }
+
+            $this->waitCount++;
+        }
+
+        /** @var ConnectionInterface|false $connection */
         $connection = $this->idle->pop($this->maxWaitTime);
 
+        if ($waitStart !== null) {
+            $waitTime = microtime(true) - $waitStart;
+            $this->waitDuration += $waitTime;
+
+            // float overflow
+            if ($this->waitDuration === PHP_FLOAT_MAX) {
+                $this->waitDuration = $waitTime;
+                $this->waitCount = 1;
+            }
+        }
+
         if ($this->idle->errCode === SWOOLE_CHANNEL_OK) {
+            // connection pool was resized
+            if ($connection === false) {
+                return $this->pop();
+            }
+
             // remove dead connection
             if ($this->testOnBorrow && !$connection->isAlive()) {
                 $this->connections->detach($connection);
 
                 // create new connection instead of dead one
-                $connection = $this->connector->connect($this->connectionConfig);
-                $this->connections->attach($connection);
+                $connection = $this->createConnection();
+
+                return $connection;
+            }
+
+            if ($this->isConnectionExpired($connection, -1)) {
+                $this->removeExpiredConnection($connection);
+
+                // create new connection instead of expired one
+                $connection = $this->createConnection();
+
+                return $connection;
+            }
+
+            if ($this->resetConnections) {
+                $this->resetConnection($connection);
             }
 
             return $connection;
@@ -412,33 +622,81 @@ abstract class Pool implements PoolInterface
         throw new PoolIsClosedException('Pool closed before an active connection could be obtained');
     }
 
-    protected function push(ConnectionInterface $connection): void
+    /**
+     * @param ConnectionInterface $connection
+     *
+     * @return int push status (read PUSH_* constant docs)
+     */
+    protected function push(ConnectionInterface $connection): int
     {
         // discard connection when pool is not initialized
         if (!$this->isInitialized) {
             $this->removeConnection($connection);
 
-            return;
+            return self::PUSH_POOL_NOT_INITIALIZED;
         }
 
-        // discard connection when pool reached connections limit
-        if ($this->connections->count() > $this->maxActive) {
+        // discard connection that is not part of this pool
+        if (!$this->connections->contains($connection)) {
             $this->removeConnection($connection);
 
-            return;
+            return self::PUSH_CONN_NOT_PART_OF_POOL;
+        }
+
+        // discard connection when pool has reached the maximum connection limit
+        if ($this->idle->isFull()) {
+            $this->removeConnection($connection);
+
+            return self::PUSH_LIMIT_REACHED;
         }
 
         // discard dead connections
         if ($this->testOnReturn && !$connection->isAlive()) {
             $this->removeConnection($connection);
 
-            return;
+            return self::PUSH_DEAD_CONNECTION;
         }
 
-        $this->idle->push($connection);
+        // discard connection due to max life time
+        if ($this->isConnectionExpired($connection, -1)) {
+            $this->removeExpiredConnection($connection);
+
+            return self::PUSH_MAX_LIFE_TIME;
+        }
+
+        if (!$this->pushConnectionToIdle($connection)) {
+            return self::PUSH_POOL_CLOSED;
+        }
+
+        return self::PUSH_OK;
     }
 
-    protected function removeConnection(ConnectionInterface $connection): void
+    private function pushConnectionToIdle(ConnectionInterface $connection): bool
+    {
+        if (!$this->idle->push($connection)) {
+            $this->removeConnection($connection);
+
+            return false;
+        }
+
+        return true;
+    }
+
+    private function createConnection(): ConnectionInterface
+    {
+        $this->lock->lock();
+
+        try {
+            $connection = $this->connector->connect($this->connectionConfig);
+            $this->connections->attach($connection, time());
+        } finally {
+            $this->lock->unlock();
+        }
+
+        return $connection;
+    }
+
+    private function removeConnection(ConnectionInterface $connection): void
     {
         $this->connections->detach($connection);
 
@@ -456,7 +714,7 @@ abstract class Pool implements PoolInterface
         }
     }
 
-    protected function validateConnections(): void
+    private function validateConnections(): void
     {
         $now = time();
 
@@ -465,6 +723,7 @@ abstract class Pool implements PoolInterface
 
         while (!$this->idle->isEmpty()) {
             $connection = $this->idle->pop();
+            // connection pool is closed
             if (false === $connection) {
                 return;
             }
@@ -483,26 +742,93 @@ abstract class Pool implements PoolInterface
                 && $connectionsCount > $this->minActive
                 && $connection->getLastUsedAt() + $this->maxIdleTime <= $now) {
                 $connectionsCount--;
-                $this->removeConnection($connection);
+                $this->removeMaxIdleTimeConnection($connection);
 
                 continue;
             }
 
-            $this->idle->push($connection);
+            // remove expired connections
+            if ($this->isConnectionExpired($connection, $now)) {
+                $connectionsCount--;
+                $this->removeExpiredConnection($connection);
+
+                continue;
+            }
+
+            $this->pushConnectionToIdle($connection);
+        }
+
+        $this->fillPool();
+    }
+
+    private function fillPool(): void
+    {
+        while ($this->connections->count() < $this->minActive) {
+            // connection pool is closed or connection is currently being created by another coroutine
+            if (!$this->isInitialized || $this->lock->isLocked()) {
+                break;
+            }
+
+            try {
+                $connection = $this->createConnection();
+            } catch (Throwable $e) {
+                // stop on connection errors
+                return;
+            }
+
+            if (!$this->pushConnectionToIdle($connection)) {
+                // connection pool is closed
+                return;
+            }
         }
     }
 
-    protected function startValidateConnectionsTimer(): void
+    private function startValidationTimer(): void
     {
-        if ($this->validateConnectionsInterval > 0) {
-            $this->validateConnectionsTimer->start();
+        if ($this->validationInterval > 0) {
+            $this->validationTimer->start();
         }
     }
 
-    protected function stopValidateConnectionsTimer(): void
+    private function stopValidationTimer(): void
     {
-        if ($this->validateConnectionsTimer->isStarted()) {
-            $this->validateConnectionsTimer->stop();
+        if ($this->validationTimer->isStarted()) {
+            $this->validationTimer->stop();
         }
+    }
+
+    private function removeMaxIdleTimeConnection(ConnectionInterface $connection): void
+    {
+        if ($this->maxIdleTimeClosedCount === PHP_INT_MAX) {
+            $this->maxIdleTimeClosedCount = 0;
+        }
+
+        $this->maxIdleTimeClosedCount++;
+
+        $this->removeConnection($connection);
+    }
+
+    private function removeExpiredConnection(ConnectionInterface $connection): void
+    {
+        if ($this->maxLifeTimeClosedCount === PHP_INT_MAX) {
+            $this->maxLifeTimeClosedCount = 0;
+        }
+
+        $this->maxLifeTimeClosedCount++;
+
+        $this->removeConnection($connection);
+    }
+
+    private function isConnectionExpired(ConnectionInterface $connection, int $time): bool
+    {
+        if ($this->maxLifeTime <= 0) {
+            return false;
+        }
+
+        if ($time === -1) {
+            $time = time();
+        }
+
+        return $this->connections[$connection] + $this->maxLifeTime <= $time;
     }
 }

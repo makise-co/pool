@@ -27,7 +27,7 @@ class Connection implements ConnectionInterface
         return $this->id;
     }
 
-    public function close()
+    public function close(): void
     {
         if (!$this->isAlive) {
             return;

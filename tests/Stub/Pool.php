@@ -30,13 +30,21 @@ class Pool extends \MakiseCo\Pool\Pool
      *
      * @param Connection|ConnectionInterface $connection
      */
-    public function push(ConnectionInterface $connection): void
+    public function push(ConnectionInterface $connection): int
     {
-        parent::push($connection);
+        return parent::push($connection);
     }
 
     protected function createDefaultConnector(): ConnectorInterface
     {
         return new Connector();
+    }
+
+    /**
+     * @param Connection $connection
+     */
+    protected function resetConnection(ConnectionInterface $connection): void
+    {
+        $connection->setLastUsedAt(322);
     }
 }
