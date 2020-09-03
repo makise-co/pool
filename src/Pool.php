@@ -525,6 +525,21 @@ abstract class Pool implements PoolInterface
     }
 
     /**
+     * Use this method only for read-only purpose
+     *
+     * @return SplObjectStorage<ConnectionInterface, int>
+     */
+    protected function getConnections(): SplObjectStorage
+    {
+        return $this->connections;
+    }
+
+    protected function getConnectionConfig(): ConnectionConfigInterface
+    {
+        return $this->connectionConfig;
+    }
+
+    /**
      * @throws PoolIsClosedException If the pool has been closed.
      * @throws BorrowTimeoutException when connection pop timeout reached
      */
