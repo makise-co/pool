@@ -224,9 +224,7 @@ abstract class Pool implements PoolInterface
         $this->stopValidationTimer();
 
         // forget all connection instances
-        foreach ($this->connections as $connection) {
-            $this->connections->detach($connection);
-        }
+        $this->connections->removeAll($this->connections);
 
         Coroutine::create(function () {
             // close all idle connections
@@ -237,7 +235,13 @@ abstract class Pool implements PoolInterface
                     break;
                 }
 
-                $this->removeConnection($connection);
+                Coroutine::create(static function (ConnectionInterface $connection) {
+                    try {
+                        $connection->close();
+                    } catch (\Throwable $e) {
+                        // Ignore connection close error
+                    }
+                }, $connection);
             }
 
             // close idle channel
@@ -743,8 +747,10 @@ abstract class Pool implements PoolInterface
                 return;
             }
 
-            // do not keep dead connections
-            if ($connection->isAlive()) {
+            if (!$connection->isAlive()) {
+                // Do not keep dead connections
+                $this->connections->detach($connection);
+            } else {
                 $connections[] = $connection;
             }
         }
